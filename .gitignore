@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.ckpt
+data/
+wandb
+venv/
+optseq.egg-info/
+*.png
+*.fa
+TEdesign.egg-info/

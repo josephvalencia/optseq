@@ -1,0 +1,13 @@
+README.md
+setup.py
+optseq/__init__.py
+optseq/categorical.py
+optseq/mcmc.py
+optseq/ngd.py
+optseq/onehot.py
+optseq/oracle_maximizer.py
+optseq/test_jacobian.py
+optseq.egg-info/PKG-INFO
+optseq.egg-info/SOURCES.txt
+optseq.egg-info/dependency_links.txt
+optseq.egg-info/top_level.txt

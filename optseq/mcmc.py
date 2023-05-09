@@ -9,23 +9,24 @@ class DiscreteMCMCSampler():
 
     def __init__(self, start_seq : torch.tensor ,
                     num_classes : int,
+                    class_dim : int,
                     output_fn : Union[Callable,torch.nn.Module],
+                    onehot_fn : Union[Callable,torch.nn.Module],
                     metropolis_adjust=True,
                     constraint_functions=[]):
         
         self.output_fn = output_fn
+        self.to_onehot = onehot_fn
         self.curr_seq = start_seq
         self.num_classes = num_classes
+        self.class_dim = class_dim
         self.metropolis = metropolis_adjust
         self.constraint_functions = constraint_functions
         self.step = 0
     
-    def to_onehot(self,src):
-        onehot = F.one_hot(src,self.num_classes).permute(0,2,1).float().requires_grad_(True)
-        return onehot
-    
     def input_grads(self,inputs):
         ''' per-sample gradient of outputs wrt. inputs '''
+         
         outputs = self.output_fn(inputs)
         total_pred = outputs.sum()
         total_pred.backward(torch.ones_like(total_pred),inputs=inputs)
@@ -41,8 +42,8 @@ class DiscreteMCMCSampler():
 class LangevinSampler(DiscreteMCMCSampler):
     '''Implements Zhang et al. ICML 2022 https://proceedings.mlr.press/v162/zhang22t.html'''
 
-    def __init__(self,start_state,num_classes,output_fn,stepsize=0.01,beta=0.999,epsilon=1e-8,metropolis_adjust=True):
-        super().__init__(start_state,num_classes,output_fn,metropolis_adjust)
+    def __init__(self,start_state,num_classes,class_dim,output_fn,onehot_fn,stepsize=1000,beta=0.999,epsilon=1e-8,metropolis_adjust=True):
+        super().__init__(start_state,num_classes,class_dim,output_fn,onehot_fn,metropolis_adjust)
         self.stepsize = stepsize
         self.beta = beta
         self.epsilon = epsilon
@@ -53,7 +54,7 @@ class LangevinSampler(DiscreteMCMCSampler):
         
         # calc q(x'|x)
         q_fwd = self.forward_proposal_dist(src=self.to_onehot(self.curr_seq))
-        next_state = q_fwd.sample() 
+        next_state = q_fwd.sample()
         # metropolis adjustment
         if self.metropolis:
             curr_seq = self.metropolis_adjustment(q_fwd,next_state)
@@ -67,7 +68,7 @@ class LangevinSampler(DiscreteMCMCSampler):
 
         self.curr_seq = curr_seq
         self.step += 1
-        return self.curr_seq
+        return self.to_onehot(self.curr_seq)
     
     def metropolis_adjustment(self,q_fwd,next_state):
         # calc q(x|x')
@@ -86,7 +87,7 @@ class LangevinSampler(DiscreteMCMCSampler):
     
     def accept_reject(self,accept_probs,next_state,curr_seq):
         ''' All positions are potentially resampled, so we need to accept/reject each position independently'''
-        random_draw = torch.log(torch.rand(accept_probs.shape)) 
+        random_draw = torch.log(torch.rand_like(accept_probs))
         acceptances = accept_probs > random_draw
         return torch.where(acceptances,next_state,curr_seq)
     
@@ -102,13 +103,14 @@ class LangevinSampler(DiscreteMCMCSampler):
     
     def langevin_proposal_dist(self,grads,onehot):
         # Taylor approx 
-        grad_current_char = (grads * onehot).sum(dim=1)
+        grad_current_char = (grads * onehot).sum(dim=self.class_dim,keepdim=True)
         mutation_scores = grads - grad_current_char
         # stepsize term
-        #temperature_term = (1.0 - onehot)**2 / (2 * self.stepsize * self.scaled_preconditioner()**2) 
-        temperature_term = (1.0 - onehot)**2 / (2 * self.stepsize)
+        temperature_term = (1.0 - onehot)**2 / (2 * self.stepsize * self.scaled_preconditioner()**2) 
         logits = 0.5 * mutation_scores - temperature_term 
-        proposal_dist = torch.distributions.Categorical(logits=logits.permute(0,2,1))
+        # ensure class dim is last 
+        dim_order = [x for x in range(logits.dim()) if x != self.class_dim] + [self.class_dim]
+        proposal_dist = torch.distributions.Categorical(logits=logits.permute(*dim_order))
         return torch.distributions.Independent(proposal_dist,0)
 
     def mask_rare_tokens(self,logits):
@@ -118,20 +120,20 @@ class LangevinSampler(DiscreteMCMCSampler):
         return logits*mask1 + mask2
     
     def update_preconditioner(self,grads):
-        ''' Inspired by Adam diagonal preconditioner '''
+        '''RMSprop preconditioner'''
         diagonal = grads.pow(2)
         self.preconditioner = self.beta*self.preconditioner + (1.0-self.beta)*diagonal 
 
     def scaled_preconditioner(self):
-        ''' Bias correction for preconditioner ''' 
+        ''' Bias correction from Adam ''' 
         bias_corrected = self.preconditioner / (1.0 - self.beta**(self.step+1)) 
         return bias_corrected.sqrt() + self.epsilon
 
 class PathAuxiliarySampler(DiscreteMCMCSampler):
     '''Implements Sun et al. ICLR 2022 https://openreview.net/pdf?id=JSR-YDImK95 '''
 
-    def __init__(self,start_state,output_fn,grad_fn,metropolis_adjust=True,constraint_functions=[],max_path_length=5):
-        super().__init__(start_state,output_fn,grad_fn,metropolis_adjust,constraint_functions)
+    def __init__(self,start_state,num_classes,class_dim,output_fn,onehot_fn,metropolis_adjust=True,constraint_functions=[],max_path_length=5):
+        super().__init__(start_state,num_classes,class_dim,output_fn,onehot_fn,metropolis_adjust,constraint_functions)
         self.max_path_length = max_path_length
         self.current_length = 1
         self.src_cache = []
@@ -200,15 +202,13 @@ class PathAuxiliarySampler(DiscreteMCMCSampler):
         return torch.distributions.Categorical(logits=mutation_scores.reshape(-1) / 2)
 
     def acceptance_probs(self,score_diff,forward_log_prob,reverse_log_prob):
-        print(f'reverse_prob: {reverse_log_prob}, forward_prob: {forward_log_prob}, score_diff: {score_diff}')
         acceptance_log_prob = score_diff + reverse_log_prob - forward_log_prob
         return torch.minimum(acceptance_log_prob,torch.tensor([0.0],device=score_diff.device))
     
     def accept_reject(self,accept_probs,next_seq,curr_seq):
         
-        random_draw = torch.log(torch.rand(accept_probs.shape)) 
+        random_draw = torch.log(torch.rand_like(accept_probs)) 
         acceptances = accept_probs > random_draw
-        print(f'P(accept): {accept_probs.exp()}') 
         if acceptances:
             return next_seq
         else:
@@ -224,7 +224,7 @@ class GibbsWithGradientsSampler(DiscreteMCMCSampler):
         # metropolis adjustment
         self.curr_seq = self.metropolis_adjustment(q_fwd,next_state)
         self.step += 1
-        return self.curr_seq
+        return self.to_onehot(self.curr_seq)
     
     def forward_proposal_dist(self,src):
         return self.gwg_proposal_dist(src)        
@@ -235,21 +235,24 @@ class GibbsWithGradientsSampler(DiscreteMCMCSampler):
     def gwg_proposal_dist(self,src):
         # Taylor approx 
         grads = self.input_grads(src)
-        grad_current_char = (grads * src).sum(dim=1)
+        grad_current_char = (grads * src).sum(dim=self.class_dim,keepdims=True)
         mutation_scores = grads - grad_current_char
         # V*(L-1) way softmax 
-        entropy = lambda x : torch.sum(-x * torch.log2(x))
-        cat_params = F.softmax(mutation_scores.reshape(-1),dim=0)
         return torch.distributions.Categorical(logits=mutation_scores.reshape(-1) / 2)
 
     def update_seq(self,next_state):
-        char_idx = torch.floor_divide(next_state,self.curr_seq.shape[1])
-        pos_idx = next_state % self.curr_seq.shape[1]
+        next_seq = self.curr_seq.clone()
+        L = next_seq.numel() 
+        char_idx = torch.floor_divide(next_state,L)
+        pos_idx = next_state % L
         # update character at position pos_idx
-        next_seq = self.curr_seq.clone() 
+        curr_shape = next_seq.shape 
         pos_idx = pos_idx.long()
         char_idx = char_idx.long()
-        next_seq[0,pos_idx] = char_idx
+        #print(f'char idx {char_idx}, pos idx {pos_idx},next_state')
+        next_seq = next_seq.reshape(-1) 
+        next_seq[pos_idx] = char_idx
+        next_seq = next_seq.reshape(curr_shape)
         return next_seq
     
     def metropolis_adjustment(self,q_fwd,next_state):
@@ -258,9 +261,10 @@ class GibbsWithGradientsSampler(DiscreteMCMCSampler):
         next_seq_onehot = self.to_onehot(next_seq)
         q_rev = self.reverse_proposal_dist(src=next_seq_onehot)
         # store the endogenous character in the position of the proposed next state  
-        next_state_pos = torch.floor_divide(next_state,self.curr_seq.shape[1]).long()
-        curr_state_char = self.curr_seq[0,next_state_pos] 
-        curr_state = next_state_pos * self.curr_seq.shape[1] + curr_state_char
+        L = self.curr_seq.numel() # assumes batchsize = 1
+        next_state_pos = torch.floor_divide(next_state,L).long()
+        curr_state_char = self.curr_seq.reshape(-1)[next_state_pos] 
+        curr_state = next_state_pos*L + curr_state_char
         # compute acceptance probabilities
         fwd_log_prob = q_fwd.log_prob(next_state)
         rev_log_prob = q_rev.log_prob(curr_state.long())
@@ -274,9 +278,51 @@ class GibbsWithGradientsSampler(DiscreteMCMCSampler):
     
     def accept_reject(self,accept_probs,next_seq,curr_seq):
         
-        random_draw = torch.log(torch.rand(accept_probs.shape)) 
+        random_draw = torch.log(torch.rand_like(accept_probs)) 
         acceptances = accept_probs > random_draw
         
+        if acceptances:
+            return next_seq
+        else:
+            return curr_seq 
+
+class RandomSampler(DiscreteMCMCSampler):
+    '''Purely random search'''
+    
+    def sample(self):
+        # generate a neighbor with a few random differences 
+        rand_chars = torch.randint_like(self.curr_seq,low=0,high=self.num_classes)
+        rand_draw = torch.rand_like(self.curr_seq,dtype=torch.float32) 
+        neighbor = torch.where(rand_draw > 0.90,rand_chars,self.curr_seq)
+        return self.to_onehot(neighbor)
+    
+class SimulatedAnnealingSampler(DiscreteMCMCSampler):
+
+    def __init__(self,start_state,num_classes,class_dim,output_fn,onehot_fn,num_steps,metropolis_adjust=True,constraint_functions=[],start_temp=25.0):
+        
+        super().__init__(start_state,num_classes,
+                         class_dim,output_fn,onehot_fn,
+                         metropolis_adjust,constraint_functions)
+        self.start_temp = start_temp
+        self.num_steps = num_steps
+
+    def sample(self):
+        # generate a neighbor with a few random differences 
+        rand_chars = torch.randint_like(self.curr_seq,low=0,high=self.num_classes)
+        rand_draw = torch.rand_like(self.curr_seq,dtype=torch.float32) 
+        neighbor = torch.where(rand_draw > 0.975,rand_chars,self.curr_seq)
+        # temperature adjusted Metropolis criteria 
+        T = self.start_temp *(1-(self.step+1)/self.num_steps)
+        score_diff = self.output_fn(self.to_onehot(neighbor)) - self.output_fn(self.to_onehot(self.curr_seq))
+        accept_probs = torch.minimum(score_diff / T,torch.tensor([0.0],device=score_diff.device))
+        self.step += 1
+        next_seq =  self.accept_reject(accept_probs,neighbor,self.curr_seq)
+        return self.to_onehot(next_seq)
+    
+    def accept_reject(self,accept_probs,next_seq,curr_seq):
+        
+        random_draw = torch.log(torch.rand_like(accept_probs)) 
+        acceptances = accept_probs > random_draw
         if acceptances:
             return next_seq
         else:

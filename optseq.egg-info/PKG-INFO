@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: optseq
+Version: 1.0.0
+Summary: OptSeq: A Python package for optimizing sequences using MCMC and deep learning
+Home-page: UNKNOWN
+Author: Joseph Valencia
+Author-email: valejose@oregonstate.edu
+License: UNKNOWN
+Description: # optseq
+        
+Platform: UNKNOWN
+Description-Content-Type: text/markdown
